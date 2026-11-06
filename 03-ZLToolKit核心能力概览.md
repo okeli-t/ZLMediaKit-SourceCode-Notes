@@ -76,9 +76,9 @@ IO 事件、定时器、跨线程投递的任务（`async()`）都在这个循�
 TaskExecutor（任务执行器抽象基类，提供 async() + 负载统计）
 └── EventPoller          每个实例 = 一个真实 pthread，跑事件循环
 
-TaskExecutorGetterImp（池子接口，getPoller() 按负载挑一个）
-├── EventPollerPool      管理一池子 EventPoller（默认 8 个），给网络 IO 用
-└── WorkThreadPool       也管理一池子 EventPoller（默认 CPU 核数个），执行非 IO 密集型任务
+TaskExecutorGetterImp（池子接口，getExecutor() 按负载挑一个最轻的）
+├── EventPollerPool      管理一池子 EventPoller（默认 8 个），给网络 IO 用；子类封装 getPoller()
+└── WorkThreadPool       也管理一池子 EventPoller（默认 CPU 核数个），执行非 IO 密集型任务；子类封装 getPoller()
 ```
 
 `ThreadPool` 是 ZLToolKit 提供的另一种线程池：Worker 线程跑的是 `while(true){ _queue.get_task(); }` 的经典模型，没有 epoll、不监听事件、没有定时器。ZLM 核心代码里不用它——网络 IO 和非 IO 任务统一走 EventPoller，ThreadPool 留给外部使用者做简单任务并发。
