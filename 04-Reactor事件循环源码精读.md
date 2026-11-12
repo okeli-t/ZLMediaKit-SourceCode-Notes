@@ -57,7 +57,7 @@ Windows 并没有单独一套 API——它引入 `win32/wepoll`，用 `epoll_cre
 
 | 实现 | 注册方式 | 每轮开销 | 硬限制 |
 |------|---------|---------|--------|
-| epoll / wepoll | `epoll_ctl` 增量注册，**内核维护红黑树存储 fd** | 只遍历就绪 fd（`ret` 个） | 单次最多 1024 个事件（`EPOLL_SIZE`） |
+| epoll / wepoll | `epoll_ctl` 增量注册，**epoll 内核用红黑树存储 fd**（wepoll 内部实现不同） | 只遍历就绪 fd（`ret` 个） | 单次最多 1024 个事件（`EPOLL_SIZE`） |
 | kqueue | `kevent` 批量注册/注销 | 只遍历就绪 kevent | 同上，`KEVENT_SIZE 1024` |
 | select | 无内核存储结构，**每轮重建全部 fd_set** | 全量遍历 `_event_map`，O(n) | `fd >= FD_SETSIZE` 直接拒绝 |
 
@@ -150,20 +150,22 @@ int64_t EventPoller::getMinDelay() {
 ```cpp
 int64_t EventPoller::flushDelayTask(uint64_t now_time) {
     decltype(_delay_task_map) task_copy;
-    task_copy.swap(_delay_task_map);                        // 先摘出来，避免边遍历边改
+    task_copy.swap(_delay_task_map);                        // 先 swap 摘出来（见下方解释）
     for (auto it = task_copy.begin(); it != task_copy.end() && it->first <= now_time; it = task_copy.erase(it)) {
         auto next_delay = (*(it->second))();                // 执行到期任务
         if (next_delay) {
-            _delay_task_map.emplace(next_delay + now_time, std::move(it->second));  // 周期任务重排
+            _delay_task_map.emplace(next_delay + now_time, std::move(it->second));  // 周期任务重排回原表
         }
     }
-    task_copy.insert(_delay_task_map.begin(), _delay_task_map.end());   // 剩余未到期任务归还
+    task_copy.insert(_delay_task_map.begin(), _delay_task_map.end());   // 剩余未到期的归还
     task_copy.swap(_delay_task_map);
     return (_delay_task_map.empty() ? -1 : _delay_task_map.begin()->first - now_time);
 }
 ```
 
-它解释了"为什么 ZLM 不需要一个独立定时器线程"——定时器不是"到点回调"的独立机制，而是**把最近到期时间换算成 `epoll_wait` 的超时值**，让 IO 等待顺便把定时器也等了。
+flushDelayTask 里先 swap 摘出整个 map、再执行到期任务、再把未到期的归还——multimap 是节点式容器，insert 本身不会让已有迭代器失效；但**边遍历边往同一容器插入**会让遍历范围和终止条件变得不可控（周期任务重排 emplace 回原表后，遍历是否会再次扫到它是未定义行为），swap 出副本后遍历边界是固定的，同时也缩短了改动容器的窗口（swap 之后 `_delay_task_map` 是空的，跨线程 `async_first` 里的 emplace 可以无锁执行）。
+
+这也解释了"为什么 ZLM 不需要一个独立定时器线程"——定时器不是"到点回调"的独立机制，而是**把最近到期时间换算成 `epoll_wait` 的超时值**，让 IO 等待顺便把定时器也等了。
 
 **核心洞察**：`minDelay` 同时承担两个语义——
 - 有定时任务：它就是"最近一个任务的剩余毫秒"，`epoll_wait` 睡这么久后醒来执行；
@@ -192,15 +194,21 @@ EventPoller::DelayTask::Ptr EventPoller::doDelayTask(uint64_t delay_ms, function
 `runLoop(bool blocked, bool ref_self)` 有两个入口参数：
 
 ```cpp
-if (blocked) {
-    runLoop(true, ref_self);         // 直接在当前线程跑（主要给 select 分支用）
-} else {
-    _loop_thread = new thread(&EventPoller::runLoop, this, true, ref_self);
-    _sem_run_started.wait();          // 等新线程走到 post() 再返回
+void EventPoller::runLoop(bool blocked, bool ref_self) {
+    if (blocked) {
+        if (ref_self) s_current_poller = shared_from_this();
+        _sem_run_started.post();    // 通知调用者：我已就绪
+        _exit_flag = false;
+        // 下面直接展开 while(!_exit_flag) 循环本体（三个平台分支）
+    } else {
+        _loop_thread = new thread(&EventPoller::runLoop, this, true, ref_self);
+        _sem_run_started.wait();    // 等新线程走到 post() 再返回
+    }
 }
 ```
 
-- `blocked=false`：`new` 一个线程去跑 `runLoop`，**并用 `_sem_run_started` 做启动同步**——新线程在进入 while 循环前先做 `post()`，构造函数/池初始化因此不会出现"poller 已返回但循环还没转"的窗口期。
+- `blocked=false`：**外部入口**，负责 `new thread` 启动循环——池初始化统一走这条（`TaskExecutor.cpp` 的 `addPoller` 传 `runLoop(false, ...)`）；
+- `blocked=true`：**新线程入口**，直接展开 while 循环本体——由上面的 `new thread` 传参进来（`EventPoller.cpp:538`），线程一进来直接跑循环；
 - `ref_self=true`：把自身写入 `thread_local s_current_poller`，这是 `EventPoller::getCurrentPoller()` 唯一的数据来源，也是"优先当前线程"的基础。
 
 顺带一提，`startSleep()/sleepWakeUp()` 两次调用夹住 `epoll_wait`，统计的是"阻塞等待占总时间的比例"——这就是官方 `getThreadsLoad` 返回的 `load` 与 `delay` 的原始数据来源。**线程负载不是估算值，而是实测的等待/唤醒间隔**。
@@ -220,11 +228,16 @@ if (blocked) {
 ```cpp
 int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
     if (isCurrentThread()) {
-        epoll_ctl(_event_fd, EPOLL_CTL_ADD, fd, &ev);            // 直接操作
-        _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
+        struct epoll_event ev = {0};
+        ev.events = toEpoll(event);
+        ev.data.fd = fd;
+        int ret = epoll_ctl(_event_fd, EPOLL_CTL_ADD, fd, &ev);
+        if (ret != -1) {
+            _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
+        }
         return ret;
     }
-    async([this, fd, event, cb]() mutable {                       // 切回 poller 线程再操作
+    async([this, fd, event, cb]() mutable {
         addEvent(fd, event, std::move(cb));
     });
     return 0;
@@ -290,7 +303,7 @@ sequenceDiagram
 
 `_event_cache_expired.clear()` 是**每轮循环开头**（`epoll_wait` 返回之后、派发事件之前）清空。为什么放这个位置是安全的？因为 `epoll_wait` 返回到 `clear()` 之间这段窗口里，poller 线程只是在跑 `sleepWakeUp()` + `if (ret <= 0)` 判断，**没有任何入口能调度业务代码**（IO 回调、定时器回调、跨线程任务都必须从事件循环的"派发阶段"才能进来），单线程 Reactor 模型天然屏蔽了这个窗口里的业务删除场景。
 
-那这个 clear 到底清的是什么？是**上一轮派发过程中残留的标记**。本轮派发过程中业务层删的 fd，标记进 expired 后，会在"本轮 clear 已经执行完、下一轮 clear 还没执行"的这段窗口里起到过滤作用——也就是下一次 `epoll_wait` 返回后、clear 之前的那一小段。
+那本轮派发过程中标记进 expired 的 fd，能在什么时候起作用？**就在本轮 for 循环里**。clear 在 for 循环之前执行，本轮派发中某个回调调了 delEvent，标记进 expired 后，for 循环继续往后遍历就能 count 到它、跳过。如果本轮没有这个 fd（快照里不存在），那标记自然会在下一轮开头的 clear 里被清掉——它不会"留到下一轮起作用"，因为下一轮的快照已经是新的了，里面不会有被 epoll_ctl(DEL) 删过的 fd。
 
 ### `getPoller` 优先返回当前线程
 
@@ -317,14 +330,14 @@ EventPoller::Ptr EventPollerPool::getPoller(bool prefer_current_thread) {
 | 使用场景 | 源码位置 | 典型用法 |
 |---------|---------|---------|
 | **推流超时** | `RtspPusher` / `RtmpPusher` | `Timer(publishTimeoutSec, [...])` 超时踢掉推流端 |
-| **拉流超时** | `RtspPlayer` / `RtmpPlayer` | `Timer(playTimeoutSec, [...])` 超时关闭拉流连接 |
-| **心跳维持** | `RtspPusher` / `RtmpPusher` / `RtspPusher` | 按协议规定的间隔（RTSP 30s、RTMP 60s）定时发心跳包 |
+| **拉流超时** | `RtspPlayer` / `RtmpPlayer` | `Timer(timeoutMS/2000.0f)` / `_rtmp_recv_timer`：接收超时检查周期，到期触发超时关闭 |
+| **心跳维持** | `RtspPusher`（RTMP 推流端无心跳定时器） | `_beat_timer` 读配置 `beat_interval_ms`（`config.cpp:417`），不是硬编码间隔 |
 | **KCP 拥塞控制** | `KcpTransport` | KCP 协议内部的重传定时器，丢包后按 RTO 重发 |
-| **RTP 丢包重传** | `RtpProcess` | WebRTC 的 NACK/TWCC 反馈、丢包检测定时 |
-| **HLS 切片** | `HlsPlayer` | 定时拉取下一片 .ts |
-| **连接超时检查** | `TcpServer` | 每 2 秒对所有 Session 跑 `onManager`（用 `doDelayTask` 直接挂，不是 Timer 封装） |
+| **RTP 会话超时** | `RtpProcess` | `Timer(3.0f, ...)` 每 3 秒调 `onManager()`，对 RTP 会话做 `alive()` 判断，超时则 `onDetach(Err_timeout)` 清理 |
+| **HLS 切片** | `HlsDemuxer::start` | 每 50ms 执行一次 `onTick()`，驱动 .ts 切片处理（类名不是 HlsPlayer） |
+| **连接超时检查** | `TcpServer` | `Timer(2.0f, [...])` 每 2 秒对所有 Session 跑 `onManager`——**就是 Timer 封装**，第 2 篇断点进过这条链路 |
 | **Pacer 限速** | `MultiMediaSourceMuxer` | `_paced_sender->resetTimer` 控制 RTP 发送节奏 |
-| **C API 延时** | `api/source/mk_thread.cpp` | `mk_media_source_start_check_timer` 等对外暴露的延时回调 |
+| **C API 延时** | `api/source/mk_thread.cpp` | `mk_timer_create / mk_timer_create2 / mk_timer_release`，底层 `TimerForC` 封装对外暴露的延时回调 |
 
 可以说没有 Timer，ZLM 的连接管理就动不起来——整个框架的心跳、超时、定时触发，全部落脚在 EventPoller 的延时任务队列上，Timer 只是这个队列上最常用的一层薄封装。
 
@@ -348,7 +361,7 @@ Timer::Timer(float second, const std::function<bool()> &cb, const EventPoller::P
 
 这就解释了第 2 篇那个"`onManager` 每 2 秒触发"的链路：`TcpServer` 内部 `Timer(2.0f, ...)` → `doDelayTask(2000, ...)` → 挂进 `_delay_task_map` → `getMinDelay` 把它算成 `epoll_wait` 的超时 → 到点执行 `onManagerSession`。**没有任何独立定时线程**。
 
-flushDelayTask 里先 swap 摘出整个 map、再执行到期任务、再把未到期的归还——这么做是因为 multimap 遍历时 emplace 可能导致内部节点重排，直接边遍历边改会让迭代器失效。
+flushDelayTask 先 swap 摘出整个 map、执行到期任务后把未到期的归还——multimap 是节点式容器，insert 本身不会让迭代器失效；但"边遍历边往同一容器插入"会让遍历范围和终止条件不可控，swap 出副本后遍历边界固定，也缩短了改动容器的窗口。
 
 ---
 
@@ -382,7 +395,7 @@ EventPoller 内部有个 `SocketRecvBuffer::weak_ptr _shared_buffer[2]`，**按�
 
 **工作流程**：**fd A 的回调用这块 buffer 读完包、处理完，fd B 的回调接着用同一块 buffer 读自己的包**。这个"轮流用"能工作，是因为同一个 poller 线程上所有回调**串行执行**（没有并发），不会出现"A 刚读到一半 B 抢过来写"的情况。
 
-非 Linux 平台更极端：`_shared_buffer[2]` 只用到 index 0——**TCP 和 UDP 共享同一块 buffer**（源码 `#if !defined(__linux)` 强制把 `is_udp` 设为 0），因为 kqueue/select 上 TCP 也用 recvfrom 路径。
+非 Linux 平台更极端：`_shared_buffer[2]` 只用到 index 0——**TCP 和 UDP 共享同一块 buffer**（源码 `#if !defined(__linux) && !defined(__linux__)` 强制把 `is_udp` 设为 0），因为 kqueue/select 上 TCP 也用 recvfrom 路径。
 
 代价：这块 buffer 不是"读完即丢"的裸 `char[]`，是带内部状态的 SocketRecvBuffer 对象，里面有 BufferList 存 UDP 多包数据；而且 buffer 生命周期绑定 poller 线程，跨线程不能用。如果某个回调把 buffer 里的数据拷出去后还长期持有 buffer 引用，那这块内存就被钉住了，影响后续 fd 的读取。
 
