@@ -5,5 +5,13 @@
 *.obj
 *.d
 
-
 ZLMediaKit
+
+# Images (generated)
+*.png
+*.jpg
+
+# 参赛相关文件
+参赛作品简介.md
+参赛表单填写参考.md
+exported_image*
