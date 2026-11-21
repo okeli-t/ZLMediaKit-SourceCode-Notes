@@ -306,7 +306,7 @@ Socket::Ptr TcpServer::onBeforeAcceptConnection(const EventPoller::Ptr &poller) 
 }
 ```
 
-注意这里是 `getPoller(false)`，**明确不要当前线程**。注释原文："此处改成自定义获取 poller 对象，防止负载不均衡"。如果沿用当前线程，那么谁抢到 accept 谁就吃下这个连接，线程之间会越差越多——抢得快的线程会一直抢到，这就是负载倾斜。
+注意这里是 `getPoller(false)`，**不优先当前线程**，直接走 `getExecutor()` 按负载均衡从全池选。注释原文："此处改成自定义获取 poller 对象，防止负载不均衡"。如果沿用当前线程，谁抢到 accept 谁就承载这个连接的全部后续 IO，线程之间会越差越多——抢得快的线程会一直抢到，这就是负载倾斜。
 
 于是常见的形态是"**A 线程 accept 到连接，连接却属于 B 线程**"，跨线程派发就此产生。
 
